@@ -20,6 +20,7 @@ from langchain.llms.loading import load_llm_from_config
 
 from langflow.interface.agents.custom import CUSTOM_AGENTS
 from langflow.interface.importing.utils import import_by_type
+from langflow.interface.run import fix_memory_inputs
 from langflow.interface.toolkits.base import toolkits_creator
 from langflow.interface.types import get_type_list
 from langflow.interface.utils import load_file_into_dict
@@ -33,6 +34,12 @@ def instantiate_class(node_type: str, base_type: str, params: Dict) -> Any:
             return custom_agent.initialize(**params)  # type: ignore
 
     class_object = import_by_type(_type=base_type, name=node_type)
+    # check if it is a class before using issubclass
+
+    # if isinstance(class_object, type) and issubclass(class_object, BaseModel):
+    #     # validate params
+    #     fields = class_object.__fields__
+    #     params = {key: value for key, value in params.items() if key in fields}
 
     if base_type == "agents":
         # We need to initialize it differently
@@ -56,6 +63,8 @@ def instantiate_class(node_type: str, base_type: str, params: Dict) -> Any:
             if isinstance(function_string, str):
                 return validate.eval_function(function_string)
             raise ValueError("Function should be a string")
+        elif node_type.lower() == "tool":
+            return class_object(**params)
     elif base_type == "toolkits":
         loaded_toolkit = class_object(**params)
         # Check if node_type has a loader
@@ -63,9 +72,17 @@ def instantiate_class(node_type: str, base_type: str, params: Dict) -> Any:
             return load_toolkits_executor(node_type, loaded_toolkit, params)
         return loaded_toolkit
     elif base_type == "embeddings":
+        # ? Why remove model from params?
         params.pop("model")
         return class_object(**params)
     elif base_type == "vectorstores":
+        if len(params.get("documents", [])) == 0:
+            # Error when the pdf or other source was not correctly
+            # loaded.
+            raise ValueError(
+                "The source you provided did not load correctly or was empty."
+                "This may cause an error in the vectorstore."
+            )
         return class_object.from_documents(**params)
     elif base_type == "documentloaders":
         return class_object(**params).load()
@@ -73,16 +90,19 @@ def instantiate_class(node_type: str, base_type: str, params: Dict) -> Any:
         documents = params.pop("documents")
         text_splitter = class_object(**params)
         return text_splitter.split_documents(documents)
+    elif base_type == "utilities":
+        if node_type == "SQLDatabase":
+            return class_object.from_uri(params.pop("uri"))
 
     return class_object(**params)
 
 
-def load_flow_from_json(path: str):
+def load_flow_from_json(path: str, build=True):
     # This is done to avoid circular imports
     from langflow.graph import Graph
 
     """Load flow from json file"""
-    with open(path, "r") as f:
+    with open(path, "r", encoding="utf-8") as f:
         flow_graph = json.load(f)
     data_graph = flow_graph["data"]
     nodes = data_graph["nodes"]
@@ -94,7 +114,19 @@ def load_flow_from_json(path: str):
     # Nodes, edges and root node
     edges = data_graph["edges"]
     graph = Graph(nodes, edges)
-    return graph.build()
+    if build:
+        langchain_object = graph.build()
+        if hasattr(langchain_object, "verbose"):
+            langchain_object.verbose = True
+
+        if hasattr(langchain_object, "return_intermediate_steps"):
+            # https://github.com/hwchase17/langchain/issues/2068
+            # Deactivating until we have a frontend solution
+            # to display intermediate steps
+            langchain_object.return_intermediate_steps = False
+        fix_memory_inputs(langchain_object)
+        return langchain_object
+    return graph
 
 
 def replace_zero_shot_prompt_with_prompt_template(nodes):
@@ -154,7 +186,9 @@ def load_agent_executor(agent_class: type[agent_module.Agent], params, **kwargs)
     allowed_tools = params["allowed_tools"]
     llm_chain = params["llm_chain"]
     tool_names = [tool.name for tool in allowed_tools]
-    agent = agent_class(allowed_tools=tool_names, llm_chain=llm_chain)
+    # Agent class requires an output_parser but Agent classes
+    # have a default output_parser.
+    agent = agent_class(allowed_tools=tool_names, llm_chain=llm_chain)  # type: ignore
     return AgentExecutor.from_agent_and_tools(
         agent=agent,
         tools=allowed_tools,
